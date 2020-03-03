@@ -1,6 +1,6 @@
 import { Base64 } from 'js-base64';
 import semaphore, { Semaphore } from 'semaphore';
-import { initial, last, partial, result, trimStart, trim } from 'lodash';
+import { initial, last, partial, result, trimStart, trim, difference } from 'lodash';
 import { oneLine } from 'common-tags';
 import {
   getAllResponses,
@@ -528,20 +528,16 @@ export default class API {
       pullRequest.head.sha,
       this.repoURL,
     );
-    // media files don't have a patch attribute, except svg files
-    const { path, newFile } = diffs
-      .filter(d => d.patch && !d.filename.endsWith('.svg'))
-      .map(f => ({ path: f.filename, newFile: f.status === 'added' }))[0];
-
-    const mediaFiles = diffs
-      .filter(d => d.filename !== path)
-      .map(({ filename: path, sha: id }) => ({
-        path,
-        id,
-      }));
+    let entries = diffs.filter(d => d.patch && !d.filename.endsWith('.svg'));
+    let mediaFiles = difference(diffs, entries);
+    entries = entries.map(e => ({ path: e.filename, newFile: e.status === 'added' }));
+    mediaFiles = mediaFiles.map(({ filename: path, sha: id }) => ({
+      path,
+      id,
+    }));
     const label = pullRequest.labels.find(l => isCMSLabel(l.name)) as { name: string };
     const status = labelToStatus(label.name);
-    return { branch, collection, slug, path, status, newFile, mediaFiles, pullRequest };
+    return { branch, collection, slug, status, entries, mediaFiles, pullRequest };
   }
 
   async readFile(
@@ -620,17 +616,11 @@ export default class API {
     }
   }
 
-  async readUnpublishedBranchFile(contentKey: string) {
+  async readUnpublishedBranchFile(contentKey: string, loadEntryMediaFiles) {
     try {
-      const {
-        branch,
-        collection,
-        slug,
-        path,
-        status,
-        newFile,
-        mediaFiles,
-      } = await this.retrieveMetadata(contentKey);
+      const { branch, collection, slug, status, entries, mediaFiles } = await this.retrieveMetadata(
+        contentKey,
+      );
 
       const repoURL = this.useOpenAuthoring
         ? `/repos/${contentKey
@@ -639,14 +629,43 @@ export default class API {
             .join('/')}`
         : this.repoURL;
 
-      const fileData = (await this.readFile(path, null, { branch, repoURL })) as string;
+      if (entries.length === 1) {
+        const { path, newFile } = entries[0];
+        const fileData = (await this.readFile(path, null, { branch, repoURL })) as string;
+        const loadedMediaFiles =
+          loadEntryMediaFiles && (await loadEntryMediaFiles(branch, mediaFiles));
 
-      return {
-        slug,
-        metaData: { branch, collection, objects: { entry: { path, mediaFiles } }, status },
-        fileData,
-        isModification: !newFile,
-      };
+        return {
+          slug,
+          file: { path, id: null },
+          metaData: { branch, collection, objects: { entry: { path, mediaFiles } }, status },
+          data: fileData,
+          isModification: !newFile,
+          ...(loadedMediaFiles && { mediaFiles: loadedMediaFiles }),
+        };
+      }
+
+      const loadedMediaFiles =
+        loadEntryMediaFiles && (await loadEntryMediaFiles(branch, mediaFiles));
+      return await Promise.all(
+        entries.map(async file => {
+          const fileData = await this.readFile(file.path, null, { branch, repoURL });
+          return {
+            slug,
+            file: { path: file.path, id: null },
+            metaData: {
+              branch,
+              collection,
+              objects: { entry: { mediaFiles } },
+              status,
+            },
+            data: fileData,
+            isModification: !file.newFile,
+            multiContentKey: contentKey,
+            ...(loadedMediaFiles && { mediaFiles: loadedMediaFiles }),
+          };
+        }),
+      );
     } catch (e) {
       throw new EditorialWorkflowError('content is not under editorial workflow', true);
     }
@@ -829,8 +848,8 @@ export default class API {
     }));
   }
 
-  async persistFiles(entry: Entry | null, mediaFiles: AssetProxy[], options: PersistOptions) {
-    const files = entry ? mediaFiles.concat(entry) : mediaFiles;
+  async persistFiles(entries: Entry[] | null, mediaFiles: AssetProxy[], options: PersistOptions) {
+    const files = entries ? mediaFiles.concat(entries) : mediaFiles;
     const uploadPromises = files.map(file => this.uploadBlob(file));
     await Promise.all(uploadPromises);
 
@@ -850,7 +869,7 @@ export default class API {
       );
       return this.editorialWorkflowGit(
         files as TreeFile[],
-        entry as Entry,
+        entries[0] as Entry,
         mediaFilesList,
         options,
       );
